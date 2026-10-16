@@ -202,7 +202,6 @@ def match_and_compare_transactions(
     # An unmatched old transaction is ambiguous if multiple candidates in updated data
     # match party + date + amount or similar strong attributes.
     ambiguous_old: Dict[str, List[NormalizedTransaction]] = defaultdict(list)
-    ambiguous_new: Dict[str, List[NormalizedTransaction]] = defaultdict(list)
 
     for o_tx in unmatched_old:
         candidates = [
@@ -213,17 +212,12 @@ def match_and_compare_transactions(
         ]
         if len(candidates) > 1:
             ambiguous_old[o_tx.guid] = candidates
-            for c in candidates:
-                ambiguous_new[c.guid].append(o_tx)
 
     pass4_old_guids: Set[str] = set()
-    pass4_new_guids: Set[str] = set()
 
     for o_guid, c_list in ambiguous_old.items():
         o_tx = old_by_guid[o_guid]
         pass4_old_guids.add(o_guid)
-        for c in c_list:
-            pass4_new_guids.add(c.guid)
 
         cand_info = [f"GUID: {c.guid}, Voucher: {c.voucher_number}, Amount: ₹{c.total_amount}" for c in c_list]
         results.append(
@@ -234,15 +228,13 @@ def match_and_compare_transactions(
                 match_reason=f"Ambiguous candidates ({len(c_list)} potential matches in updated snapshot)",
                 candidates=[c.guid for c in c_list],
                 unresolved_reason=f"Multiple candidate vouchers found for party '{o_tx.party_name}' on date {o_tx.date}: " + "; ".join(cand_info),
-                amount_difference=Decimal("0.00"),
-                tds_difference=Decimal("0.00"),
+                amount_difference=-o_tx.total_amount,
+                tds_difference=-o_tx.tds_amount,
             )
         )
 
     matched_old_guids.update(pass4_old_guids)
-    matched_new_guids.update(pass4_new_guids)
     unmatched_old = [tx for tx in unmatched_old if tx.guid not in matched_old_guids]
-    unmatched_new = [tx for tx in unmatched_new if tx.guid not in matched_new_guids]
 
     # =========================================================================
     # PASS 5 — Remaining Old (MISSING) & Remaining New (NEW)

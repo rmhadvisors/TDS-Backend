@@ -1,18 +1,29 @@
+import logging
 import time
 import uuid
-from typing import Dict, Tuple
-from fastapi import APIRouter, File, HTTPException, Response, UploadFile, status
-from fastapi.responses import JSONResponse
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Dict, Optional, Tuple
+from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from app.models.comparison_models import (
     ComparisonResponse,
     ComparisonSummarySchema,
     ReconciliationSchema,
     ReportInfoSchema,
+    UnresolvedSectionSchema,
+    UserKeywordSchema,
 )
-from app.services.excel_report import generate_excel_report
+from app.services.company_check import PARTIES_MISMATCH_ERROR, find_company_mismatch
+from app.services.excel_report import derive_period_and_party, find_unresolved_sections, generate_excel_report
 from app.services.master_comparator import compare_masters
-from app.services.normalizer import normalize_master, normalize_transaction
+from app.services.normalizer import (
+    discover_tds_parties,
+    is_tds_viable_transaction,
+    normalize_master,
+    normalize_transaction,
+)
 from app.services.parser import (
     ValidationError,
     validate_and_extract_masters,
@@ -24,17 +35,22 @@ from app.services.tds_calculator import (
     calculate_party_summaries,
 )
 from app.services.transaction_matcher import match_and_compare_transactions
+from app.services.user_keywords import add_user_keyword, list_user_keywords, remove_user_keyword, section_options
+from app.services import report_store
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["comparison"])
 
-# In-memory storage for reports with timestamp for automatic cleanup
-REPORT_STORAGE: Dict[str, Tuple[bytes, float]] = {}
+# Reports just generated stay in memory for an hour (fast download straight after a comparison, and still
+# downloadable if saving to the history store failed); every report is also kept in the history store.
+REPORT_STORAGE: Dict[str, Tuple[bytes, float, str]] = {}
 REPORT_TTL_SECONDS = 3600  # 1 hour
 
 
 def _cleanup_old_reports():
     now = time.time()
-    expired = [k for k, (_, ts) in REPORT_STORAGE.items() if now - ts > REPORT_TTL_SECONDS]
+    expired = [k for k, (_, ts, _) in REPORT_STORAGE.items() if now - ts > REPORT_TTL_SECONDS]
     for k in expired:
         REPORT_STORAGE.pop(k, None)
 
@@ -45,6 +61,9 @@ async def compare_snapshots(
     transactions_old: UploadFile = File(..., description="Original Transactions JSON"),
     master_new: UploadFile = File(..., description="Updated Master JSON"),
     transactions_new: UploadFile = File(..., description="Updated Transactions JSON"),
+    party_name: Optional[str] = Form(None, description="Optional Party Name"),
+    period: Optional[str] = Form(None, description="Optional Period / Date Range"),
+    tds_rows: Optional[str] = Form("bill", description="TDS Working rows: 'bill' (one row per bill, datewise as in the vouchers) or 'month' (per deductee per month, as in the 26Q return)"),
 ):
     _cleanup_old_reports()
 
@@ -113,7 +132,27 @@ async def compare_snapshots(
             content={"error": "Data Normalization Failed", "details": errors}
         )
 
-    # 4. Compare Master & Transactions
+    # All four files must come from the same party (Tally company)
+    mismatch = find_company_mismatch([
+        ("Original Master JSON", (m.guid for m in norm_m_old)),
+        ("Original Transaction JSON", (t.guid for t in norm_t_old)),
+        ("Updated Master JSON", (m.guid for m in norm_m_new)),
+        ("Updated Transaction JSON", (t.guid for t in norm_t_new)),
+    ])
+    if mismatch:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"error": PARTIES_MISMATCH_ERROR, "details": [mismatch]}
+        )
+
+    # 4. Filter to only TDS-viable transactions using automated two-pass discovery
+    tds_parties = discover_tds_parties(norm_m_old, norm_m_new, norm_t_old, norm_t_new)
+    # unfiltered vouchers of the snapshot the TDS Working is built from: TDS challans give the deposit dates
+    all_t_working = norm_t_new or norm_t_old
+    norm_t_old = [tx for tx in norm_t_old if is_tds_viable_transaction(tx, tds_parties)]
+    norm_t_new = [tx for tx in norm_t_new if is_tds_viable_transaction(tx, tds_parties)]
+
+    # 5. Compare Master & Transactions
     try:
         master_changes = compare_masters(norm_m_old, norm_m_new)
         comparisons = match_and_compare_transactions(norm_t_old, norm_t_new)
@@ -152,16 +191,42 @@ async def compare_snapshots(
         )
 
     # 7. Generate Excel Report
+    derived_party, derived_period = derive_period_and_party(
+        norm_t_old=norm_t_old,
+        norm_t_new=norm_t_new,
+        norm_m_old=norm_m_old,
+        norm_m_new=norm_m_new,
+        party_name=party_name,
+        period=period,
+    )
+
+    all_masters = (norm_m_new or []) + (norm_m_old or [])
     excel_bytes = generate_excel_report(
         summary=summary_data,
         reconciliation=reconciliation,
         party_summaries=party_summaries,
         comparisons=comparisons,
         master_changes=master_changes,
+        party_name=derived_party,
+        period=derived_period,
+        masters=all_masters,
+        tds_rows="month" if (tds_rows or "").strip().lower() == "month" else "bill",
+        all_transactions=all_t_working,
     )
 
     download_id = str(uuid.uuid4())
-    REPORT_STORAGE[download_id] = (excel_bytes, time.time())
+    created = datetime.now(timezone.utc)
+    filename = report_store.download_filename(derived_party, derived_period, created)
+    REPORT_STORAGE[download_id] = (excel_bytes, time.time(), filename)
+    try:
+        report_store.get_store().save(
+            report_store.make_object_name(download_id, derived_party, derived_period, created), excel_bytes
+        )
+        saved_to_history = True
+    except Exception:
+        logger.exception("Could not save report %s to the history store", download_id)
+        saved_to_history = False
+    unresolved = find_unresolved_sections(comparisons, all_masters, all_t_working)
 
     return ComparisonResponse(
         success=True,
@@ -174,9 +239,13 @@ async def compare_snapshots(
             errors=reconciliation.errors,
         ),
         report=ReportInfoSchema(
-            filename="TDS_Change_Comparison_Report.xlsx",
+            filename=filename,
             download_id=download_id,
-        )
+            saved_to_history=saved_to_history,
+            party_name=derived_party,
+            period=derived_period,
+        ),
+        unresolved_sections=[UnresolvedSectionSchema(**u) for u in unresolved],
     )
 
 
@@ -184,18 +253,82 @@ async def compare_snapshots(
 async def download_report(download_id: str):
     _cleanup_old_reports()
     item = REPORT_STORAGE.get(download_id)
-    if not item:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Report not found or has expired. Please run the comparison again."
-        )
+    if item:
+        excel_bytes, _, filename = item
+    else:
+        try:
+            stored = report_store.find_report(download_id)
+        except Exception:
+            logger.exception("Could not look up report %s in the history store", download_id)
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Report storage is unavailable.")
+        if not stored:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Report not found. Please run the comparison again."
+            )
+        store = report_store.get_store()
+        if store.kind == "s3":
+            # The browser fetches the file straight from the private bucket with a link valid for a few minutes.
+            return RedirectResponse(store.presigned_url(stored), status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+        excel_bytes, filename = store.read(stored), stored.filename
 
-    excel_bytes, _ = item
     return Response(
         content=excel_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="TDS_Change_Comparison_Report.xlsx"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.get("/history")
+async def get_report_history(
+    search: str = Query("", description="Filter by party name or period"),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """Every report generated so far (shared by all users of the app), newest first."""
+    try:
+        reports = report_store.list_reports(search, limit)
+    except Exception:
+        logger.exception("Could not list the history store")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Report history is unavailable.")
+    return {"storage": report_store.get_store().kind, "reports": [r.as_dict() for r in reports]}
+
+
+@router.delete("/history/{report_id}")
+async def delete_report(report_id: str):
+    """Removes a report for everyone: from the history store (the S3 object itself) and the 1-hour memory cache."""
+    try:
+        stored = report_store.find_report(report_id)
+        if stored:
+            report_store.get_store().delete(stored)
+    except Exception:
+        logger.exception("Could not delete report %s from the history store", report_id)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not delete the report from storage.")
+    cached = REPORT_STORAGE.pop(report_id, None)
+    if not stored and not cached:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found.")
+    return {"deleted": report_id}
+
+
+@router.get("/keywords")
+async def get_user_keywords():
+    """Keywords users added for natures of payment the statutory list does not know, and the sections to pick from."""
+    return {"keywords": list_user_keywords(), "sections": section_options()}
+
+
+@router.post("/keywords")
+async def post_user_keyword(item: UserKeywordSchema):
+    try:
+        saved = add_user_keyword(item.keyword, item.section)
+    except ValueError as e:
+        return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"error": "Invalid keyword", "details": [str(e)]})
+    return {"saved": saved, "keywords": list_user_keywords()}
+
+
+@router.delete("/keywords/{keyword}")
+async def delete_user_keyword(keyword: str):
+    if not remove_user_keyword(keyword):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Keyword '{keyword}' not found.")
+    return {"keywords": list_user_keywords()}
 
 
 @router.get("/health")

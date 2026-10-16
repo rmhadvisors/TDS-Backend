@@ -57,10 +57,64 @@ def test_compare_endpoint_flow():
     assert data["reconciliation"]["transaction_count"] == "PASS"
 
     download_id = data["report"]["download_id"]
+    assert data["report"]["party_name"] == "Aayat Enterprises"
+    assert data["report"]["period"] == "2026-08-01"
+
     dl_res = client.get(f"/api/download/{download_id}")
     assert dl_res.status_code == 200
     assert dl_res.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     assert len(dl_res.content) > 1000
+
+    # Verify Party Name and Period in Excel file
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(dl_res.content))
+    ws = wb["Summary"]
+    assert ws["A3"].value == "Party Name"
+    assert ws["B3"].value == "Aayat Enterprises"
+    assert ws["A4"].value == "Period"
+    assert ws["B4"].value == "2026-08-01"
+
+
+def test_compare_with_custom_party_and_period():
+    master_json = json.dumps([{"GUID": "M-1", "NAME": "Custom Vendor Ltd", "ISTDSAPPLICABLE": "Yes"}]).encode("utf-8")
+    tx_json = json.dumps([{
+        "GUID": "TX-1",
+        "VOUCHERNUMBER": "1",
+        "VOUCHERTYPENAME": "Payment",
+        "DATE": "2025-04-15",
+        "PARTYLEDGERNAME": "Custom Vendor Ltd",
+        "ALLLEDGERENTRIES.LIST": [
+            {"LEDGERNAME": "Custom Vendor Ltd", "AMOUNT": "-50000.00", "ISDEEMEDPOSITIVE": "No"},
+            {"LEDGERNAME": "Expense", "AMOUNT": "50000.00", "ISDEEMEDPOSITIVE": "Yes"}
+        ]
+    }]).encode("utf-8")
+
+    files = {
+        "master_old": ("Master.json", io.BytesIO(master_json), "application/json"),
+        "transactions_old": ("Transactions.json", io.BytesIO(tx_json), "application/json"),
+        "master_new": ("Master1.json", io.BytesIO(master_json), "application/json"),
+        "transactions_new": ("Transactions1.json", io.BytesIO(tx_json), "application/json"),
+    }
+    data_payload = {
+        "party_name": "ABC Corporation Ltd",
+        "period": "FY 2025-26 (Q1)",
+    }
+
+    res = client.post("/api/compare", files=files, data=data_payload)
+    assert res.status_code == 200, res.text
+    resp_data = res.json()
+    assert resp_data["report"]["party_name"] == "ABC Corporation Ltd"
+    assert resp_data["report"]["period"] == "FY 2025-26 (Q1)"
+
+    download_id = resp_data["report"]["download_id"]
+    dl_res = client.get(f"/api/download/{download_id}")
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(dl_res.content))
+    ws = wb["Summary"]
+    assert ws["A3"].value == "Party Name"
+    assert ws["B3"].value == "ABC Corporation Ltd"
+    assert ws["A4"].value == "Period"
+    assert ws["B4"].value == "FY 2025-26 (Q1)"
 
 
 def test_compare_with_sample_files():
@@ -86,10 +140,10 @@ def test_compare_with_sample_files():
     data = res.json()
     assert data["success"] is True
     summary = data["summary"]
-    assert summary["original_transactions"] == 133
-    assert summary["updated_transactions"] == 117
-    assert summary["unchanged"] == 117
-    assert summary["missing"] == 16
+    assert summary["original_transactions"] == 7
+    assert summary["updated_transactions"] == 6
+    assert summary["unchanged"] == 6
+    assert summary["missing"] == 1
     assert summary["modified"] == 0
     assert summary["recreated"] == 0
     assert summary["new"] == 0

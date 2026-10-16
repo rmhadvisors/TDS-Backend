@@ -65,6 +65,8 @@ class NormalizedTransaction:
     tds_rate: Optional[Decimal] = None
     tds_section: Optional[str] = None
     raw_reference: Dict[str, Any] = field(default_factory=dict)
+    is_optional: bool = False    # Tally "optional" (memo / provisional) voucher — not part of the books
+    is_cancelled: bool = False
 
 
 @dataclass
@@ -169,6 +171,20 @@ class ReportInfoSchema(BaseModel):
     model_config = ConfigDict(extra="ignore")
     filename: str
     download_id: str
+    party_name: Optional[str] = None
+    period: Optional[str] = None
+    saved_to_history: bool = True
+
+
+class UnresolvedSectionSchema(BaseModel):
+    """TDS Working rows whose section was only guessed: the ledgers / party a user keyword can be taken from."""
+    model_config = ConfigDict(extra="ignore")
+    names: List[str]
+    guessed_section: str
+    deductee: str
+    rows: int
+    tds: str
+    vouchers: List[str] = []
 
 
 class ComparisonResponse(BaseModel):
@@ -177,3 +193,9 @@ class ComparisonResponse(BaseModel):
     summary: ComparisonSummarySchema
     reconciliation: ReconciliationSchema
     report: ReportInfoSchema
+    unresolved_sections: List[UnresolvedSectionSchema] = []
+
+
+class UserKeywordSchema(BaseModel):
+    keyword: str
+    section: str

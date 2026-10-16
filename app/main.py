@@ -1,3 +1,11 @@
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Settings such as TDS_S3_BUCKET and the AWS keys; real environment variables take precedence.
+for _env in (Path(__file__).resolve().parents[1] / ".env", Path(__file__).resolve().parent / ".env"):
+    load_dotenv(_env)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.comparison import router as comparison_router

@@ -158,3 +158,10 @@ def test_ambiguous_candidates_unresolved():
     assert unres[0].old_transaction.guid == "GUID-OLD"
     assert "GUID-NEW-1" in unres[0].candidates
     assert "GUID-NEW-2" in unres[0].candidates
+
+    from app.services.reconciliation import perform_reconciliation
+    rec = perform_reconciliation([t_old], [t_new1, t_new2], results)
+    assert rec.is_valid is True
+    assert rec.transaction_count == "PASS"
+    assert rec.amount == "PASS"
+    assert rec.tds == "PASS"
