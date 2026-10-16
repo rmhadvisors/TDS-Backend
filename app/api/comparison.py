@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -57,19 +58,20 @@ def _cleanup_old_reports():
 
 @router.post("/compare", response_model=ComparisonResponse)
 async def compare_snapshots(
-    master_old: UploadFile = File(..., description="Original Master JSON"),
     transactions_old: UploadFile = File(..., description="Original Transactions JSON"),
-    master_new: UploadFile = File(..., description="Updated Master JSON"),
+    master_new: UploadFile = File(..., description="Latest Master JSON (used for both snapshots unless master_old is given)"),
     transactions_new: UploadFile = File(..., description="Updated Transactions JSON"),
     party_name: Optional[str] = Form(None, description="Optional Party Name"),
     period: Optional[str] = Form(None, description="Optional Period / Date Range"),
     tds_rows: Optional[str] = Form("bill", description="TDS Working rows: 'bill' (one row per bill, datewise as in the vouchers) or 'month' (per deductee per month, as in the 26Q return)"),
+    master_old: Optional[UploadFile] = File(None, description="Optional Original Master JSON - only needed when ledgers were renamed or deleted after filing"),
 ):
     _cleanup_old_reports()
 
-    # 1. Read files
+    # 1. Read files. The master rarely changes after filing, so normally only the latest one is uploaded and it
+    # stands in for the original too - one large file less to upload and parse.
     try:
-        content_m_old = await master_old.read()
+        content_m_old = await master_old.read() if master_old is not None else None
         content_t_old = await transactions_old.read()
         content_m_new = await master_new.read()
         content_t_new = await transactions_new.read()
@@ -81,7 +83,7 @@ async def compare_snapshots(
 
     # 2. Parse & Extract
     try:
-        raw_m_old = validate_and_extract_masters(content_m_old)
+        raw_m_old = validate_and_extract_masters(content_m_old) if content_m_old is not None else []
         raw_t_old = validate_and_extract_transactions(content_t_old)
         raw_m_new = validate_and_extract_masters(content_m_new)
         raw_t_new = validate_and_extract_transactions(content_t_new)
@@ -112,6 +114,10 @@ async def compare_snapshots(
         except ValidationError as e:
             errors.append(f"Updated Master: {e.message}")
 
+    original_master_given = content_m_old is not None
+    if not original_master_given:
+        norm_m_old = norm_m_new
+
     norm_t_old = []
     for idx, r in enumerate(raw_t_old):
         try:
@@ -133,8 +139,8 @@ async def compare_snapshots(
         )
 
     # All four files must come from the same party (Tally company)
-    mismatch = find_company_mismatch([
-        ("Original Master JSON", (m.guid for m in norm_m_old)),
+    mismatch = find_company_mismatch(
+        ([("Original Master JSON", (m.guid for m in norm_m_old))] if original_master_given else []) + [
         ("Original Transaction JSON", (t.guid for t in norm_t_old)),
         ("Updated Master JSON", (m.guid for m in norm_m_new)),
         ("Updated Transaction JSON", (t.guid for t in norm_t_new)),
@@ -151,6 +157,18 @@ async def compare_snapshots(
     all_t_working = norm_t_new or norm_t_old
     norm_t_old = [tx for tx in norm_t_old if is_tds_viable_transaction(tx, tds_parties)]
     norm_t_new = [tx for tx in norm_t_new if is_tds_viable_transaction(tx, tds_parties)]
+
+    # Ledgers posted in the original TDS vouchers that the latest master no longer has were renamed or deleted after
+    # filing; their details (group, PAN, section) are only in the original master, so the user is asked for it.
+    # The posted ledger names are checked, not the voucher's party name: that is display text and may differ from the
+    # ledger ("Ugamraj Singhvi" on a voucher posted to "Ugamraj Singhvi(Labour)"). Names match ignoring case, spaces
+    # and punctuation, as vouchers can spell a ledger differently ("Input Cgst @2.5%" posted to "INPUT CGST@2.5%").
+    missing_master_ledgers = []
+    if not original_master_given:
+        key = lambda name: re.sub(r"[^a-z0-9]", "", name.lower())
+        master_names = {key(m.name) for m in norm_m_new if m.name}
+        missing_master_ledgers = sorted({l.ledger_name.strip() for tx in norm_t_old for l in tx.ledgers
+                                         if l.ledger_name and key(l.ledger_name) not in master_names})
 
     # 5. Compare Master & Transactions
     try:
@@ -246,6 +264,7 @@ async def compare_snapshots(
             period=derived_period,
         ),
         unresolved_sections=[UnresolvedSectionSchema(**u) for u in unresolved],
+        missing_master_ledgers=missing_master_ledgers,
     )
 
 

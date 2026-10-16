@@ -75,6 +75,46 @@ def test_compare_endpoint_flow():
     assert ws["B4"].value == "2026-08-01"
 
 
+def _single_master_payload(party_ledger):
+    master = json.dumps([
+        {"GUID": "M-1", "NAME": party_ledger, "PARENT": "Sundry Creditors", "PAN": "ABCDE1234F", "ISTDSAPPLICABLE": "Yes", "TDSSECTION": "194C"},
+        {"GUID": "M-2", "NAME": "TDS on Contractors", "PARENT": "Duties & Taxes"},
+        {"GUID": "M-3", "NAME": "Contractor Charges", "PARENT": "Indirect Expenses"},
+    ]).encode("utf-8")
+    tx = json.dumps([{
+        "GUID": "TX-101", "VOUCHERNUMBER": "101", "VOUCHERTYPENAME": "Payment", "DATE": "2026-08-01",
+        "PARTYLEDGERNAME": "Aayat Enterprises",
+        "ALLLEDGERENTRIES.LIST": [
+            {"LEDGERNAME": "Aayat Enterprises", "AMOUNT": "-90000.00", "ISDEEMEDPOSITIVE": "No"},
+            {"LEDGERNAME": "TDS on Contractors", "AMOUNT": "-10000.00", "ISDEEMEDPOSITIVE": "No", "IS_TDS": "Yes"},
+            {"LEDGERNAME": "Contractor Charges", "AMOUNT": "100000.00", "ISDEEMEDPOSITIVE": "Yes"},
+        ],
+    }]).encode("utf-8")
+    return {
+        "transactions_old": ("Transactions.json", io.BytesIO(tx), "application/json"),
+        "master_new": ("Master.json", io.BytesIO(master), "application/json"),
+        "transactions_new": ("Transactions1.json", io.BytesIO(tx), "application/json"),
+    }
+
+
+def test_compare_with_latest_master_only():
+    # No original master: the latest one is used for both snapshots
+    res = client.post("/api/compare", files=_single_master_payload("Aayat Enterprises"))
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["summary"]["original_transactions"] == 1
+    assert data["summary"]["unchanged"] == 1
+    assert data["reconciliation"]["is_valid"] is True
+    assert data["missing_master_ledgers"] == []
+
+
+def test_latest_master_missing_a_filed_party_is_reported():
+    # The party of the filed voucher was renamed in the latest master
+    res = client.post("/api/compare", files=_single_master_payload("Aayat Enterprises Pvt Ltd"))
+    assert res.status_code == 200, res.text
+    assert res.json()["missing_master_ledgers"] == ["Aayat Enterprises"]
+
+
 def test_compare_with_custom_party_and_period():
     master_json = json.dumps([{"GUID": "M-1", "NAME": "Custom Vendor Ltd", "ISTDSAPPLICABLE": "Yes"}]).encode("utf-8")
     tx_json = json.dumps([{

@@ -194,6 +194,9 @@ class ComparisonResponse(BaseModel):
     reconciliation: ReconciliationSchema
     report: ReportInfoSchema
     unresolved_sections: List[UnresolvedSectionSchema] = []
+    # Original-voucher parties missing from the latest master (renamed/deleted after filing); empty when the
+    # original master was uploaded
+    missing_master_ledgers: List[str] = []
 
 
 class UserKeywordSchema(BaseModel):
