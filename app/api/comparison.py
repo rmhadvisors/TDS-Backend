@@ -2,6 +2,7 @@ import logging
 import re
 import time
 import uuid
+import zlib
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Optional, Tuple
@@ -56,6 +57,25 @@ def _cleanup_old_reports():
         REPORT_STORAGE.pop(k, None)
 
 
+GZIP_MAGIC = b"\x1f\x8b"
+MAX_UNCOMPRESSED_BYTES = 2 * 1024 ** 3  # 2 GB per file; the largest real export so far is ~550 MB
+
+
+async def _read_upload(upload: UploadFile) -> bytes:
+    """The uploaded file's bytes. The frontend gzips files before upload (Tally JSON shrinks 20-70x), so a gzip
+    file is unpacked here, refusing anything that would unpack beyond MAX_UNCOMPRESSED_BYTES; plain JSON passes as is."""
+    content = await upload.read()
+    if content[:2] != GZIP_MAGIC:
+        return content
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = d.decompress(content, MAX_UNCOMPRESSED_BYTES + 1)
+    if len(out) > MAX_UNCOMPRESSED_BYTES or d.unconsumed_tail:
+        raise ValueError(f"{upload.filename} unpacks to more than {MAX_UNCOMPRESSED_BYTES // 1024 ** 3} GB")
+    if not d.eof:
+        raise ValueError(f"{upload.filename} is an incomplete gzip file (upload interrupted?)")
+    return out
+
+
 @router.post("/compare", response_model=ComparisonResponse)
 async def compare_snapshots(
     transactions_old: UploadFile = File(..., description="Original Transactions JSON"),
@@ -73,10 +93,10 @@ async def compare_snapshots(
     # 1. Read files. The master rarely changes after filing, so normally only the latest one is uploaded and it
     # stands in for the original too - one large file less to upload and parse.
     try:
-        content_m_old = await master_old.read() if master_old is not None else None
-        content_t_old = await transactions_old.read()
-        content_m_new = await master_new.read()
-        content_t_new = await transactions_new.read()
+        content_m_old = await _read_upload(master_old) if master_old is not None else None
+        content_t_old = await _read_upload(transactions_old)
+        content_m_new = await _read_upload(master_new)
+        content_t_new = await _read_upload(transactions_new)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

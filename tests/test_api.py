@@ -115,6 +115,28 @@ def test_latest_master_missing_a_filed_party_is_reported():
     assert res.json()["missing_master_ledgers"] == ["Aayat Enterprises"]
 
 
+def _gzipped(files):
+    import gzip
+    return {k: (name + ".gz", io.BytesIO(gzip.compress(f.getvalue())), "application/gzip") for k, (name, f, _) in files.items()}
+
+
+def test_gzipped_uploads_give_the_same_result():
+    plain = client.post("/api/compare", files=_single_master_payload("Aayat Enterprises")).json()
+    zipped = client.post("/api/compare", files=_gzipped(_single_master_payload("Aayat Enterprises")))
+    assert zipped.status_code == 200, zipped.text
+    assert zipped.json()["summary"] == plain["summary"]
+    assert zipped.json()["report"]["period"] == plain["report"]["period"]
+
+
+def test_truncated_gzip_upload_is_rejected():
+    files = _gzipped(_single_master_payload("Aayat Enterprises"))
+    name, f, ctype = files["transactions_new"]
+    files["transactions_new"] = (name, io.BytesIO(f.getvalue()[:-20]), ctype)
+    res = client.post("/api/compare", files=files)
+    assert res.status_code == 400
+    assert "incomplete gzip" in res.text
+
+
 def test_typed_period_is_shown_in_summary():
     res = client.post("/api/compare", files=_single_master_payload("Aayat Enterprises"),
                       data={"period_from": "2026-04-01", "period_to": "2027-03-31"})
