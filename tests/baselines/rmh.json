@@ -1,7 +1,7 @@
 {
 "TDS Summary": [
 [
-"ALL PARTIES (44 PARTIES) — TDS SUMMARY DASHBOARD 2025-06-20 TO 2026-03-16",
+"ALL PARTIES (44 PARTIES) — TDS SUMMARY DASHBOARD 20/06/2025 TO 16/03/2026",
 "",
 "",
 "",
@@ -16,7 +16,7 @@
 ""
 ],
 [
-"2025-06-20 to 2026-03-16  |  Auto-calculated from TDS Working sheet",
+"20/06/2025 to 16/03/2026  |  Auto-calculated from TDS Working sheet",
 "",
 "",
 "",
@@ -347,7 +347,7 @@
 ],
 [
 "ANNUAL TOTAL",
-"2025-06-20 to 2026-03-16",
+"20/06/2025 to 16/03/2026",
 "=SUM(C22:C25)",
 "=SUM(D22:D25)",
 "",
@@ -408,7 +408,7 @@
 ],
 "TDS Working": [
 [
-"ALL PARTIES (44 PARTIES) — TDS WORKING 2025-06-20 TO 2026-03-16",
+"ALL PARTIES (44 PARTIES) — TDS WORKING 20/06/2025 TO 16/03/2026",
 "",
 "",
 "",
@@ -4694,7 +4694,7 @@
 ],
 "Review Points": [
 [
-"ALL PARTIES (44 PARTIES) — AUDIT REVIEW POINTS & OBSERVATIONS 2025-06-20 TO 2026-03-16",
+"ALL PARTIES (44 PARTIES) — AUDIT REVIEW POINTS & OBSERVATIONS 20/06/2025 TO 16/03/2026",
 "",
 "",
 "",
@@ -5143,7 +5143,7 @@
 ],
 [
 "Period",
-"2025-06-20 to 2026-03-16",
+"20/06/2025 to 16/03/2026",
 "",
 "",
 ""

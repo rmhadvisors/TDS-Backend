@@ -58,7 +58,7 @@ def test_compare_endpoint_flow():
 
     download_id = data["report"]["download_id"]
     assert data["report"]["party_name"] == "Aayat Enterprises"
-    assert data["report"]["period"] == "2026-08-01"
+    assert data["report"]["period"] == "01/08/2026"
 
     dl_res = client.get(f"/api/download/{download_id}")
     assert dl_res.status_code == 200
@@ -72,7 +72,7 @@ def test_compare_endpoint_flow():
     assert ws["A3"].value == "Party Name"
     assert ws["B3"].value == "Aayat Enterprises"
     assert ws["A4"].value == "Period"
-    assert ws["B4"].value == "2026-08-01"
+    assert ws["B4"].value == "01/08/2026"
 
 
 def _single_master_payload(party_ledger):
@@ -113,6 +113,24 @@ def test_latest_master_missing_a_filed_party_is_reported():
     res = client.post("/api/compare", files=_single_master_payload("Aayat Enterprises Pvt Ltd"))
     assert res.status_code == 200, res.text
     assert res.json()["missing_master_ledgers"] == ["Aayat Enterprises"]
+
+
+def test_typed_period_is_shown_in_summary():
+    res = client.post("/api/compare", files=_single_master_payload("Aayat Enterprises"),
+                      data={"period_from": "2026-04-01", "period_to": "2027-03-31"})
+    assert res.status_code == 200, res.text
+    assert res.json()["report"]["period"] == "01/04/2026 to 31/03/2027"
+
+    import openpyxl
+    content = client.get(f"/api/download/{res.json()['report']['download_id']}").content
+    assert openpyxl.load_workbook(io.BytesIO(content))["Summary"]["B4"].value == "01/04/2026 to 31/03/2027"
+
+
+def test_period_end_not_typed_comes_from_vouchers():
+    # Only From typed: To is the latest voucher date (01/08/2026)
+    res = client.post("/api/compare", files=_single_master_payload("Aayat Enterprises"), data={"period_from": "2026-04-01"})
+    assert res.status_code == 200, res.text
+    assert res.json()["report"]["period"] == "01/04/2026 to 01/08/2026"
 
 
 def test_compare_with_custom_party_and_period():

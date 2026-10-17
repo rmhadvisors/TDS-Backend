@@ -63,6 +63,8 @@ async def compare_snapshots(
     transactions_new: UploadFile = File(..., description="Updated Transactions JSON"),
     party_name: Optional[str] = Form(None, description="Optional Party Name"),
     period: Optional[str] = Form(None, description="Optional Period / Date Range"),
+    period_from: Optional[str] = Form(None, description="Optional report period start, YYYY-MM-DD (earliest voucher date if not given)"),
+    period_to: Optional[str] = Form(None, description="Optional report period end, YYYY-MM-DD (latest voucher date if not given)"),
     tds_rows: Optional[str] = Form("bill", description="TDS Working rows: 'bill' (one row per bill, datewise as in the vouchers) or 'month' (per deductee per month, as in the 26Q return)"),
     master_old: Optional[UploadFile] = File(None, description="Optional Original Master JSON - only needed when ledgers were renamed or deleted after filing"),
 ):
@@ -216,6 +218,8 @@ async def compare_snapshots(
         norm_m_new=norm_m_new,
         party_name=party_name,
         period=period,
+        period_from=period_from,
+        period_to=period_to,
     )
 
     all_masters = (norm_m_new or []) + (norm_m_old or [])

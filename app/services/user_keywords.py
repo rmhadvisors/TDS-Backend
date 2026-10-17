@@ -84,6 +84,9 @@ def _save(entries: List[Dict[str, str]]) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
     tmp.replace(path)
+    # Two saves within the file system's timestamp resolution leave the mtime unchanged, so the cache is dropped
+    # here rather than trusting the mtime check in _load
+    _CACHE["path"] = None
 
 
 def add_user_keyword(keyword: str, section: str) -> Dict[str, str]:

@@ -44,13 +44,13 @@ def _compare():
 def test_report_is_kept_in_history_and_downloadable_after_memory_expires():
     report = _compare()
     assert report["saved_to_history"] is True
-    assert report["filename"].startswith("TDS_Report_Aayat-Enterprises_2026-08-01_")
+    assert report["filename"].startswith("TDS_Report_Aayat-Enterprises_01-08-2026_")
 
     history = client.get("/api/history").json()
     assert history["storage"] == "local"
     assert [r["report_id"] for r in history["reports"]] == [report["download_id"]]
     assert history["reports"][0]["party_name"] == "Aayat Enterprises"
-    assert history["reports"][0]["period"] == "2026-08-01"
+    assert history["reports"][0]["period"] == "01/08/2026"
     assert history["reports"][0]["filename"] == report["filename"]
 
     comparison.REPORT_STORAGE.clear()  # as after the 1-hour memory cache or a server restart

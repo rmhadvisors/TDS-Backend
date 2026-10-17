@@ -148,10 +148,14 @@ def derive_period_and_party(
     norm_m_new: Optional[List[Any]] = None,
     party_name: Optional[str] = None,
     period: Optional[str] = None,
+    period_from: Optional[str] = None,
+    period_to: Optional[str] = None,
 ) -> Tuple[str, str]:
     """
     Derives canonical party name and period strings, using explicitly provided
     values if given, or extracting them automatically from transactions/masters.
+    The period is "dd/mm/yyyy to dd/mm/yyyy": the user's From / To dates (YYYY-MM-DD) where given, the
+    earliest / latest voucher date for the end that is not.
     """
     # 1. Party Name
     final_party = (party_name or "").strip()
@@ -188,17 +192,22 @@ def derive_period_and_party(
             if d and str(d).strip():
                 dates.append(str(d).strip())
 
-        if dates:
-            min_date = min(dates)
-            max_date = max(dates)
-            if min_date == max_date:
-                final_period = min_date
-            else:
-                final_period = f"{min_date} to {max_date}"
-        else:
+        start = (period_from or "").strip() or (min(dates) if dates else "")
+        end = (period_to or "").strip() or (max(dates) if dates else "")
+        if not start or not end:
             final_period = "Full Period"
+        elif start == end:
+            final_period = _ddmmyyyy(start)
+        else:
+            final_period = f"{_ddmmyyyy(start)} to {_ddmmyyyy(end)}"
 
     return final_party, final_period
+
+
+def _ddmmyyyy(value: str) -> str:
+    """"2026-03-31" (or a datetime string starting with it) -> "31/03/2026"; anything else unchanged."""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", value)
+    return f"{m.group(3)}/{m.group(2)}/{m.group(1)}" if m else value
 
 
 def _auto_adjust_column_widths(ws, min_width: int = 14, max_width: int = 65):
