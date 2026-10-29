@@ -24,9 +24,9 @@ from app.services.tds_statutory_rates import (
     is_statutory_keyword_match,
     is_statutory_tds_party_name,
 )
-from app.services.normalizer import is_pure_tds_adjustment_journal, is_excluded_non_tds_party
+from app.services.normalizer import get_tds_context, is_pure_tds_adjustment_journal, is_excluded_non_tds_party
 from app.services.tds_context import build_tds_context
-from app.services.tds_deductions import BookedDeduction, extract_booked_deductions, find_194q_not_deducted, group_by_deductee_month
+from app.services.tds_deductions import BookedDeduction, extract_booked_deductions, find_194q_not_deducted, group_by_deductee_month, taxable_194q_by_bill
 
 # Colors and styles
 HEADER_FILL = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
@@ -328,6 +328,21 @@ def get_goods_base_amount(tx) -> Decimal:
     return tot
 
 
+def _bills_goods(tx) -> bool:
+    """A purchase voucher with a goods line: a debit to a purchase ledger (its group, else its name)."""
+    vt = (getattr(tx, "voucher_type", "") or "").upper()
+    if "PURCHASE" not in vt:
+        return False
+    ctx = get_tds_context()
+    for l in getattr(tx, "ledgers", []) or []:
+        if not getattr(l, "is_debit", False) or getattr(l, "is_tds", False):
+            continue
+        cat = ctx.category(l.ledger_name) if ctx is not None else None
+        if cat == "PURCHASE" or (cat is None and "PURCHASE" in (l.ledger_name or "").upper()):
+            return True
+    return False
+
+
 def infer_tds_section_and_rate(tx, party_pan_map: Optional[Dict[str, str]] = None) -> Tuple[str, str, str]:
     """
     Infers statutory TDS section, deduction rate, and nature note for a transaction
@@ -438,6 +453,11 @@ def infer_tds_section_and_rate(tx, party_pan_map: Optional[Dict[str, str]] = Non
             if re.search(pattern, all_names_upper):
                 matched_rule = rule
                 break
+
+    # 2a. A purchase voucher that bills goods is a purchase of goods (194Q) as a whole: freight, packing and other
+    # charges on the supplier's invoice are part of the goods value, not a separate 194C contract.
+    if not matched_rule and _bills_goods(tx):
+        matched_rule = next((r for r in STATUTORY_TDS_REGISTRY if r.section_code == "194Q"), None)
 
     # 2b. Match by Statutory Nature of Payment Keywords
     non_tds_names_upper = " ".join([
@@ -574,11 +594,14 @@ def compute_transaction_tds_calculation(
     rt_str: str,
     is_backdated: bool,
     cutoff_date: Optional[str] = None,
+    taxable_194q: Optional[Decimal] = None,
 ) -> StatutoryTDSCalculation:
     """
     Computes statutory TDS calculation:
     - Forward Calculation: For Invoices, Purchases, Journals (Gross Base * Rate)
     - Backward Calculation: For Net Payments / Advances u/s 195A (Net Paid / (1 - Rate) - Net Paid)
+    taxable_194q: for a 194Q goods bill, the part above the seller's Rs 50 lakh for the FY (taxable_194q_by_bill);
+    when given it is the base instead of the whole bill.
     """
     total_amt = getattr(tx, "total_amount", Decimal("0.00")) or Decimal("0.00")
     booked_tds = getattr(tx, "tds_amount", Decimal("0.00")) or Decimal("0.00")
@@ -617,6 +640,8 @@ def compute_transaction_tds_calculation(
     gst_amt = Decimal("0.00")
     for l in (getattr(tx, "ledgers", []) or []):
         lname = (l.ledger_name or "").upper()
+        if any(w in lname for w in ("PURCHASE", "SALES", "EXPENSE", "FREIGHT")):
+            continue                          # "Purchase IGST@18%" is the goods value, not a duty
         if any(k in lname for k in ["INPUT IGST", "INPUT CGST", "INPUT SGST", "OUTPUT IGST", "OUTPUT CGST", "OUTPUT SGST", "RCM IGST", "RCM CGST", "RCM SGST", "IGST@", "CGST@", "SGST@", "IGST @", "CGST @", "SGST @"]):
             gst_amt += abs(l.amount)
         elif lname.startswith("INPUT ") or lname.startswith("OUTPUT ") or lname.startswith("RCM "):
@@ -639,6 +664,8 @@ def compute_transaction_tds_calculation(
     else:
         calc_mode = "Forward (Gross Invoice)"
         gross_base = effective_total
+        if sec.startswith("194Q") and taxable_194q is not None:
+            gross_base = taxable_194q
         statutory_tds = (gross_base * rate_decimal).quantize(Decimal("0.01"))
 
     shortfall = (statutory_tds - booked_tds).quantize(Decimal("0.01"))
@@ -668,6 +695,11 @@ def compute_transaction_tds_calculation(
                 f"Extended period transaction on {tx.date} for ₹{float(gross_base):,.2f} with "
                 f"TDS of ₹{float(booked_tds):,.2f} booked in Tally. To be included in next regular TDS return."
             )
+    if gross_base != effective_total and sec.startswith("194Q") and taxable_194q is not None:
+        comp_note += (
+            f" 194Q applies only above Rs 50 lakh per seller per FY: ₹{float(gross_base):,.2f} of this bill's "
+            f"₹{float(effective_total):,.2f} (ex-GST) is above the limit."
+        )
 
     return StatutoryTDSCalculation(
         calc_mode=calc_mode,
@@ -2191,11 +2223,38 @@ def _build_review_points_sheet(
         ))
         item_no += 1
 
-    # 2. Check for multi-section vendors (e.g. 194C labour vs 194Q goods)
+    # 2. Check for multi-section vendors (e.g. 194C labour vs 194Q goods). Only bills say what was bought: a payment
+    # to the vendor has no cost line, and a bill whose TDS ledger and cost ledgers name no nature ("Sundry Expenses")
+    # only gets the 194C fallback, so neither counts.
+    from app.services.tds_statutory_rates import suggest_statutory_rule
+    ctx = get_tds_context()
+
+    def _cost_lines(t) -> List[str]:
+        out = []
+        for l in t.ledgers or []:
+            if not l.is_debit or l.is_tds or (t.party_name and l.ledger_name == t.party_name):
+                continue
+            cat = ctx.category(l.ledger_name) if ctx is not None else None
+            if cat in ("EXPENSE", "PURCHASE", "FIXED_ASSET") or (
+                    cat is None and not is_gst_duty_ledger(l.ledger_name)
+                    and not any(b in l.ledger_name.upper() for b in ["BANK", "CASH", "ROUND OFF"])):
+                out.append(l.ledger_name)
+        return out
+
+    def _named_by_bill(t, sec: str, costs: List[str]) -> bool:
+        if sec != "194C" or any(l.is_tds for l in t.ledgers or []):
+            return True
+        return any((r := suggest_statutory_rule(n)) is not None and r.section_code == "194C" for n in costs)
+
     for p_up, txs in sorted(seen_parties.items()):
         secs = set()
         for t in txs:
+            costs = _cost_lines(t)
+            if not costs:
+                continue
             sec, _, _ = infer_tds_section_and_rate(t)
+            if not _named_by_bill(t, sec, costs):
+                continue
             if sec:
                 secs.add(sec)
         if len(secs) > 1 and ("194C" in secs and "194Q" in secs):
@@ -2331,6 +2390,8 @@ def generate_excel_report(
         c for c in new_items
         if (not max_orig_date) or (c.new_transaction and c.new_transaction.date > max_orig_date)
     ]
+    # 194Q is due only on the part of a goods bill above the seller's Rs 50 lakh for the FY, which needs every bill
+    taxable_194q = taxable_194q_by_bill(all_transactions, get_tds_context()) if all_transactions else {}
 
     # -------------------------------------------------------------------------
     # TDS Working & Summary Sheets (Zeon / MK4 Dashboard Suite)
@@ -2824,7 +2885,8 @@ def generate_excel_report(
     for item in backdated_items:
         tx = item.new_transaction
         sec, rt, nt = infer_tds_section_and_rate(tx)
-        calc = compute_transaction_tds_calculation(tx, sec, rt, is_backdated=True, cutoff_date=max_orig_date)
+        calc = compute_transaction_tds_calculation(tx, sec, rt, is_backdated=True, cutoff_date=max_orig_date,
+                                                   taxable_194q=taxable_194q.get(tx.guid))
 
         tot_base_bk += calc.base_amount
         tot_calc_bk += calc.statutory_tds
@@ -2932,7 +2994,8 @@ def generate_excel_report(
     for item in new_month_items:
         tx = item.new_transaction
         sec, rt, nt = infer_tds_section_and_rate(tx)
-        calc = compute_transaction_tds_calculation(tx, sec, rt, is_backdated=False, cutoff_date=max_orig_date)
+        calc = compute_transaction_tds_calculation(tx, sec, rt, is_backdated=False, cutoff_date=max_orig_date,
+                                                   taxable_194q=taxable_194q.get(tx.guid))
 
         tot_base_nm += calc.base_amount
         tot_calc_nm += calc.statutory_tds

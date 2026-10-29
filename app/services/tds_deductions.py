@@ -542,6 +542,48 @@ def _voucher_level_deduction(tx: NormalizedTransaction, ctx: Optional[TDSContext
 THRESHOLD_194Q = Decimal("5000000.00")
 
 
+def _goods_bills_194q(
+    transactions: Iterable[NormalizedTransaction], ctx: Optional[TDSContext],
+) -> List[Tuple[NormalizedTransaction, Optional[str], Decimal, Decimal]]:
+    """
+    (bill, seller, goods value, part above Rs 50 lakh) for every goods bill, in date order. Goods value is the
+    purchase lines ex-GST plus, on a purchase voucher, the freight/packing etc. the supplier charges on the same
+    invoice. The Rs 50 lakh is per seller per FY; seller is None when the bill names none (nothing is taxable).
+    """
+    from app.services.normalizer import _fy_of
+
+    txs = sorted((t for t in transactions if t is not None and not t.is_optional and not t.is_cancelled),
+                 key=lambda t: (t.date or "", t.voucher_number or ""))
+    cumulative: Dict[Tuple[str, str], Decimal] = defaultdict(Decimal)
+    out: List[Tuple[NormalizedTransaction, Optional[str], Decimal, Decimal]] = []
+    for tx in txs:
+        goods = sum(((l.amount if l.is_debit else -l.amount) for l in tx.ledgers
+                     if _category(l.ledger_name, ctx) == "PURCHASE"), _ZERO)
+        if goods == _ZERO:
+            continue
+        if "PURCHASE" in (tx.voucher_type or "").upper():
+            # freight, packing etc. on the supplier's goods invoice are part of the purchase value (ex-GST)
+            goods += sum(((l.amount if l.is_debit else -l.amount) for l in tx.ledgers
+                          if _category(l.ledger_name, ctx) == "EXPENSE" and not _is_duty_or_round_off(l.ledger_name, ctx)), _ZERO)
+        sellers = [l for l in tx.ledgers if _category(l.ledger_name, ctx) not in ("PURCHASE", "DUTY", "ROUND_OFF", "EXPENSE", "BANK", "CASH")
+                   and _section_of(l, ctx) is None]
+        if not sellers:
+            out.append((tx, None, goods, _ZERO))
+            continue
+        seller = max(sellers, key=lambda l: l.amount).ledger_name
+        key = (seller.upper(), _fy_of(tx.date))
+        before = cumulative[key]
+        cumulative[key] += goods
+        taxable = min(max(cumulative[key] - max(before, THRESHOLD_194Q), _ZERO), goods)
+        out.append((tx, seller, goods, taxable))
+    return out
+
+
+def taxable_194q_by_bill(transactions: Iterable[NormalizedTransaction], ctx: Optional[TDSContext]) -> Dict[str, Decimal]:
+    """guid -> the part of that goods bill above the seller's Rs 50 lakh for the FY (0 while under it)."""
+    return {tx.guid: taxable for tx, _, _, taxable in _goods_bills_194q(transactions, ctx)}
+
+
 def find_194q_not_deducted(
     transactions: Iterable[NormalizedTransaction],
     ctx: Optional[TDSContext],
@@ -554,32 +596,16 @@ def find_194q_not_deducted(
     (Dr Supplier / Cr TDS, no bill) covers that month's bills first. Rows carry tds = 0 so the working shows the
     TDS due and the shortfall.
     """
-    from app.services.normalizer import _fy_of
-
-    txs = sorted((t for t in transactions if t is not None and not t.is_optional and not t.is_cancelled),
-                 key=lambda t: (t.date or "", t.voucher_number or ""))
     bill_guids: set = set()
     candidates: List[Tuple[NormalizedTransaction, str, Decimal]] = []
-    cumulative: Dict[Tuple[str, str], Decimal] = defaultdict(Decimal)
-    for tx in txs:
-        goods = sum(((l.amount if l.is_debit else -l.amount) for l in tx.ledgers
-                     if _category(l.ledger_name, ctx) == "PURCHASE"), _ZERO)
-        if goods == _ZERO:
-            continue
+    for tx, seller, goods, taxable in _goods_bills_194q(transactions, ctx):
         bill_guids.add(tx.guid)
-        sellers = [l for l in tx.ledgers if _category(l.ledger_name, ctx) not in ("PURCHASE", "DUTY", "ROUND_OFF", "EXPENSE", "BANK", "CASH")
-                   and _section_of(l, ctx) is None]
-        if not sellers:
+        if seller is None:
             continue
-        seller = max(sellers, key=lambda l: l.amount).ledger_name
-        key = (seller.upper(), _fy_of(tx.date))
-        before = cumulative[key]
-        cumulative[key] += goods
         if any(l.is_credit and _section_of(l, ctx) is not None for l in tx.ledgers):
             continue                              # TDS booked on the bill itself
-        taxable = cumulative[key] - max(before, THRESHOLD_194Q)
         if taxable > _ZERO:
-            candidates.append((tx, seller, min(taxable, goods)))
+            candidates.append((tx, seller, taxable))
 
     # 194Q deducted by journal (no bill in the voucher) for a supplier in a month covers that month's bills
     cover: Dict[Tuple[str, str], Decimal] = defaultdict(Decimal)
